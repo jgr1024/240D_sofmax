@@ -1,0 +1,198 @@
+)(
+    input logic [inputIntDigit + inputFracDigit - 1:0] softmaxInput[DATACOUNT], // Use binary number
+    output logic [LUTIntDigit + LUTFracDigit - 1:0] softmaxOutput[DATACOUNT]
+);
+
+// LUT values for each possible input
+// No need to calculate for 0 digits
+logic [LUTIntDigit + LUTFracDigit - 1:0] PosIntLUT; // LUT for the first int digit, if input is positive
+logic [LUTIntDigit + LUTFracDigit - 1:0] NegIntLUT; // LUT for the first int digit, if input is negative
+logic [LUTIntDigit + LUTFracDigit - 1:0] IntLUT[inputIntDigit-1]; // LUT for the rest of Int
+logic [LUTIntDigit + LUTFracDigit - 1:0] FracLUT[inputFracDigit]; // LUT for the rest of Frac
+
+// Selected input for the actual input
+logic [LUTIntDigit + LUTFracDigit - 1:0] IntLUT_selected[inputIntDigit];
+logic [LUTIntDigit + LUTFracDigit - 1:0] FracLUT_selected[inputFracDigit];
+logic [(LUTIntDigit+LUTFracDigit)*2 - 1:0] LUT_mult_intermediate;
+logic [LUTIntDigit + LUTFracDigit - 1:0] LUTOutput[DATACOUNT];
+
+// Sum up each element's LUT values
+logic [LUTIntDigit + LUTFracDigit - 1:0] LUTsum;
+logic [LUTIntDigit + LUTFracDigit - 1:0] LUTsum_prev;
+
+// Store the shift amount in the shift unit for DIV
+logic [$clog2(LUTIntDigit)-1:0] shamt_right; // Right shift amount
+logic [$clog2(LUTFracDigit)-1:0] shamt_left; // Left shift amount
+logic [LUTIntDigit + LUTFracDigit - 1:0] shiftedLUTsum; // D' in DIV
+
+// X_0 value for the ITR Units
+logic [LUTIntDigit + LUTFracDigit - 1:0] DIV_ITR_x0;
+logic [LUTIntDigit + LUTFracDigit - 1:0] DIV_ITR_x[DIV_ITR_COUNT];
+logic [LUTIntDigit + LUTFracDigit - 1:0] x0_POSconstant, x0_NEGconstant;
+logic [(LUTIntDigit+LUTFracDigit)*2 - 1:0] DIV_ITR_x0_intermediate;
+
+// Multiplication intermediates for the ITR Units
+logic [(LUTIntDigit+LUTFracDigit)*2 - 1:0] ITR_mult_intermediate0;
+logic [(LUTIntDigit+LUTFracDigit)*2 - 1:0] ITR_mult_intermediate1;
+
+// Final result multiplication intermediates
+logic [(LUTIntDigit+LUTFracDigit)*2 - 1:0] output_mult_intermediate;
+
+always_comb begin
+    for (int inputCount = 0; inputCount < DATACOUNT; inputCount++) begin
+         // Handle positive and negative exponents using different first digit ROMs
+        if (softmaxInput[inputCount][inputIntDigit + inputFracDigit - 1] == 1'b0) begin
+            IntLUT_selected[inputIntDigit - 1] = PosIntLUT;
+        end else begin
+            IntLUT_selected[inputIntDigit - 1] = NegIntLUT;
+        end
+        // Itergate through each positive digit from the integer part of input
+        for (int intDigitCounter = 0; intDigitCounter < inputIntDigit - 1; intDigitCounter++) begin
+            if (softmaxInput[inputCount][inputFracDigit + intDigitCounter] == 1'b1) begin
+                IntLUT_selected[intDigitCounter] = IntLUT[intDigitCounter];
+            end else begin
+                // If the original digit is 0, only need to multiply by 1
+                IntLUT_selected[intDigitCounter] = ('0 + 1'b1) << (LUTFracDigit);
+            end
+        end
+        // Now iterate through each digit from the fractional part of input
+        for (int fracDigitCounter = 0; fracDigitCounter < inputFracDigit; fracDigitCounter++) begin
+            // Find the corresponding LUT value to use for the value of that digit
+            if (softmaxInput[inputCount][fracDigitCounter] == 1'b1) begin
+                FracLUT_selected[fracDigitCounter] = FracLUT[fracDigitCounter];
+            end else begin
+                // If the original digit is 0, only need to multiply by 1
+                FracLUT_selected[fracDigitCounter] = ('0 + 1'b1) << (LUTFracDigit);
+            end
+        end
+        // Now implement the multiplication logic
+        // Fixed point multiplication is simple: reference in README.md
+        // A simple shift-and-add will work. To simplify, expand the width and then narrow.
+        // At this point, we are not sure how the MUL unit is implemented, simply use * operator in sv.
+        LUT_mult_intermediate = '0; // Zero out the values to begin with
+        LUT_mult_intermediate = IntLUT_selected[0]; //Give it the first value to begin with
+        for (int expIter = 1; expIter < inputIntDigit; expIter++) begin
+            // Implement each MULT unit
+            LUT_mult_intermediate = LUT_mult_intermediate*IntLUT_selected[expIter];
+            // Discard overflown bits
+            LUT_mult_intermediate = LUT_mult_intermediate << LUTIntDigit;
+            LUT_mult_intermediate = LUT_mult_intermediate >> LUTIntDigit;
+            LUT_mult_intermediate = LUT_mult_intermediate >> LUTFracDigit;
+        end
+        for (int expIter = 0; expIter < inputFracDigit; expIter++) begin
+            LUT_mult_intermediate = LUT_mult_intermediate*FracLUT_selected[expIter];
+            // Discard overflown bits
+            LUT_mult_intermediate = LUT_mult_intermediate << LUTIntDigit;
+            LUT_mult_intermediate = LUT_mult_intermediate >> LUTIntDigit;
+            LUT_mult_intermediate = LUT_mult_intermediate >> LUTFracDigit;
+        end
+        // Only take the effective bits
+        LUTOutput[inputCount] = LUT_mult_intermediate[LUTIntDigit+LUTFracDigit- 1:0];
+    end
+
+    // Sum up the softmax values
+    // For now just use a for-loop to individually add up the components
+    // since result is unsigned, if overflows just terminate and use the largest
+    // possible value for the result
+    LUTsum = '0; // Zero out the value to begin with
+    LUTsum_prev = '0;
+    for (int inputCount = 0; inputCount < DATACOUNT; inputCount++) begin
+        LUTsum = LUTsum + LUTOutput[inputCount];
+        if (LUTsum_prev > LUTsum) begin
+            // If overflow occurs, terminate the for loop and just use the largest
+            // possible value as sum
+            LUTsum = '1;
+            break;
+        end
+        LUTsum_prev = LUTsum;
+    end
+    // DIV unit
+    // First shift sum by shamt number of digits unitl 0.5 < sum < 1
+    shiftedLUTsum = ('0 + 1'b1) << (LUTFracDigit); // Start with 1, no need to shift
+    shamt_right = '0; // initially the shift amount is 0
+    shamt_left = '0; // initially the shift amount is 0
+    if (LUTsum > shiftedLUTsum) begin // If LUTSum > 1, need to perform right shift
+        // Since LUTSum is already bigger than shiftedLUTsum, must perform at least 1 shift
+        shiftedLUTsum = shiftedLUTsum << 1;
+        shamt_right = shamt_right + 1'b1; // Increment if shift amount
+        for (int int_digit_counter = 1; int_digit_counter < LUTIntDigit - 1; int_digit_counter++) begin
+            if (LUTsum > shiftedLUTsum) begin
+                shiftedLUTsum = shiftedLUTsum << 1;
+                shamt_right = shamt_right + 1'b1; // Increment if shift amount
+            end
+        end
+        shiftedLUTsum = LUTsum >> shamt_right; // Perform the calculated shift with shamt
+    end else begin // If LUTSum < 1, need to check if it is smaller than 0.5
+        // need to perform right shift if the value is smaller than 0.5
+        shiftedLUTsum = shiftedLUTsum >> 1;
+        // Only keep shifting if the LUTSum is smaller than 0.5, otherwise the amount is perfect
+        for (int frac_digit_counter = 0; frac_digit_counter < LUTFracDigit - 1; frac_digit_counter++) begin
+            if (LUTsum < shiftedLUTsum) begin
+                shiftedLUTsum = shiftedLUTsum >> 1;
+                shamt_left = shamt_left + 1'b1; // Increment if shift amount
+            end
+        end
+        shiftedLUTsum = LUTsum << shamt_left; // Perform the calculated shift with shamt
+    end
+    // generate x0 unit and process sum (constants used need to be generated with code)
+    // Since the fixed point representation of 48/17 and -32/17 needs to be computed
+    DIV_ITR_x0_intermediate = shiftedLUTsum * x0_NEGconstant;
+    // Discard overflown bits in the multiplication
+    DIV_ITR_x0_intermediate = DIV_ITR_x0_intermediate << LUTIntDigit;
+    DIV_ITR_x0_intermediate = DIV_ITR_x0_intermediate >> LUTIntDigit;
+    DIV_ITR_x0_intermediate = DIV_ITR_x0_intermediate >> LUTFracDigit;
+    DIV_ITR_x0 = x0_POSconstant - DIV_ITR_x0_intermediate[LUTIntDigit+LUTFracDigit- 1:0];
+
+    // generate DIV_ITR_COUNT number of ITR units to process shifted sum and x_i values
+    // Handle the first ITR Unit independently
+    // DIV_ITR_x[0] = shiftedLUTsum * DIV_ITR_x0 * (2 - shiftedLUTsum * DIV_ITR_x0);
+    ITR_mult_intermediate0 = shiftedLUTsum * DIV_ITR_x0;
+    // Discard overflown bits
+    ITR_mult_intermediate0 = ITR_mult_intermediate0 << LUTIntDigit;
+    ITR_mult_intermediate0 = ITR_mult_intermediate0 >> LUTIntDigit;
+    ITR_mult_intermediate0 = ITR_mult_intermediate0 >> LUTFracDigit;
+    ITR_mult_intermediate1 = (('0 + 1'b1) << (LUTFracDigit + 1)) - ITR_mult_intermediate0;
+
+    // Perform the final multiplication
+    ITR_mult_intermediate1 = ITR_mult_intermediate1[LUTIntDigit+LUTFracDigit- 1:0] 
+                            * ITR_mult_intermediate0[LUTIntDigit+LUTFracDigit- 1:0];
+    // Discard overflown bits
+    ITR_mult_intermediate1 = ITR_mult_intermediate1 << LUTIntDigit;
+    ITR_mult_intermediate1 = ITR_mult_intermediate1 >> LUTIntDigit;
+    ITR_mult_intermediate1 = ITR_mult_intermediate1 >> LUTFracDigit;
+    DIV_ITR_x[0] = ITR_mult_intermediate1[LUTIntDigit+LUTFracDigit- 1:0];
+    for (int itr_counter = 1; itr_counter < DIV_ITR_COUNT; itr_counter++) begin
+        // DIV_ITR_x[itr_counter] = shiftedLUTsum * DIV_ITR_x[itr_counter - 1]
+        //                         * (2 - shiftedLUTsum * DIV_ITR_x[itr_counter - 1]);
+        ITR_mult_intermediate0 = shiftedLUTsum * DIV_ITR_x[itr_counter - 1];
+        // Discard overflown bits
+        ITR_mult_intermediate0 = ITR_mult_intermediate0 << LUTIntDigit;
+        ITR_mult_intermediate0 = ITR_mult_intermediate0 >> LUTIntDigit;
+        ITR_mult_intermediate0 = ITR_mult_intermediate0 >> LUTFracDigit;
+        ITR_mult_intermediate1 = (('0 + 1'b1) << (LUTFracDigit + 1)) - ITR_mult_intermediate0;
+        // Perform the final multiplication
+        ITR_mult_intermediate1 = ITR_mult_intermediate1[LUTIntDigit+LUTFracDigit- 1:0] 
+                                * ITR_mult_intermediate0[LUTIntDigit+LUTFracDigit- 1:0];
+        // Discard overflown bits
+        ITR_mult_intermediate1 = ITR_mult_intermediate1 << LUTIntDigit;
+        ITR_mult_intermediate1 = ITR_mult_intermediate1 >> LUTIntDigit;
+        ITR_mult_intermediate1 = ITR_mult_intermediate1 >> LUTFracDigit;
+        DIV_ITR_x[itr_counter] = ITR_mult_intermediate1[LUTIntDigit+LUTFracDigit- 1:0];
+    end
+    // Now the division result is stored in DIV_ITR_x[DIV_ITR_COUNT - 1]
+    // Begin doing mult for all the output
+    // Restore the shifted value
+    DIV_ITR_x[DIV_ITR_COUNT - 1] = DIV_ITR_x[DIV_ITR_COUNT - 1] << shamt_right;
+    DIV_ITR_x[DIV_ITR_COUNT - 1] = DIV_ITR_x[DIV_ITR_COUNT - 1] >> shamt_left;
+
+    for (int inputCount = 0; inputCount < DATACOUNT; inputCount++) begin
+        // softmaxOutput[inputCount] = LUTOutput[inputCount] * DIV_ITR_x[DIV_ITR_COUNT - 1];
+        output_mult_intermediate = LUTOutput[inputCount] * DIV_ITR_x[DIV_ITR_COUNT - 1];
+        output_mult_intermediate = output_mult_intermediate << LUTIntDigit;
+        output_mult_intermediate = output_mult_intermediate >> LUTIntDigit;
+        output_mult_intermediate = output_mult_intermediate >> LUTFracDigit;
+        softmaxOutput[inputCount] = output_mult_intermediate[LUTIntDigit+LUTFracDigit- 1:0];
+    end
+end
+
+always_comb begin
